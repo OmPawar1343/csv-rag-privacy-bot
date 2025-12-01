@@ -51,3 +51,14 @@ It lets users ask natural‑language questions over CSVs while enforcing:
 ├─ privacy_utils.py             # Privacy Meter & logging utilities
 ├─ privacy_report.py            # Generate privacy risk reports from logs
 └─ .gitignore
+
+Install dependencies
+chromadb
+langchain-community
+pandas
+tabulate
+ollama
+llm-guard
+guardrails-ai
+presidio-analyzer
+presidio-anonymizer
