@@ -1,17 +1,17 @@
 # rag.py
 # Updated pipeline:
-# - Stage 1A: LLM Guard sanitize
+# - Stage 1A: LLM Guard sanitize (from safety_orchestrator, telemetry only — no block here)
 # - Stage 1B: RBAC/self-only early (same level as LLM Guard)
-# - Stage 1C: Input third-party guards-only (injection/jailbreak/secrets/toxicity)
-# - Stage 2: Input fallback (value-only regex) + denylist (skipped for self)
-# Retrieval/Output: for self = secrets-only block; for others = full PII block.
-# Raga/Giskard = offline/shadow only.
+# - Stage 1C: Input third-party guards-only (injection/jailbreak/secrets/toxicity) via safety_orchestrator
+# - Stage 2: Input fallback (value-only regex) + denylist (centralized in safety_orchestrator; skipped for self)
+# - Retrieval/Output: for self = secrets-only block; for others = full PII block via safety_orchestrator.
+# - Raga/Giskard = offline/shadow only.
 
 
 
 
 # --- Silence third‑party logs and progress bars (place at very top) ---
-import os, sys, logging, contextlib
+import os, sys, logging
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["DISABLE_TQDM"] = "1"
 os.environ["TQDM_DISABLE"] = "1"
@@ -59,12 +59,13 @@ from langchain_community.llms.ollama import Ollama
 from embeddings.embedding_model import get_embedding_model
 from privacy_utils import PRIVACY_METER, privacy_meter_report
 
-# Updated orchestrator imports
+# Updated orchestrator imports (centralized safety / gates)
 from safety_orchestrator import (
-    guard_input_anytrue_guards_only,  # third-party guards only at input (no PII intent)
-    guard_input_regex_only,           # regex-only input check (value-only, after RBAC)
+    guard_input_anytrue_guards_only,  # Stage 1C: third-party guards only at input (no PII intent)
+    guard_input_regex_only,           # Stage 2: regex-only input check (value-only, after RBAC)
     guard_retrieval_anytrue,
     guard_output_anytrue,
+    llm_guard_scan_prompt,           # Stage 1A: sanitize + scanner results for Privacy Meter
     FRIENDLY_MSG,
 )
 
@@ -82,95 +83,10 @@ SELF_TARGET_PREFER = os.getenv("SELF_TARGET_PREFER", "empid").lower()
 
 # Admin bypass toggles
 ADMIN_BYPASS_ANYTRUE     = os.getenv("ADMIN_BYPASS_ANYTRUE", "1").lower() in ("1","true","yes","on")
-ADMIN_BYPASS_LLM_GUARD   = os.getenv("ADMIN_BYPASS_LLM_GUARD", "1").lower() in ("1","true","yes","on")
-ADMIN_BYPASS_DENYLIST    = os.getenv("ADMIN_BYPASS_DENYLIST", "1").lower() in ("1","true","yes","on")
 ADMIN_BYPASS_GUARDRAILS  = os.getenv("ADMIN_BYPASS_GUARDRAILS", "1").lower() in ("1","true","yes","on")
 
-# ========= LLM Guard (third-party) =========
-# Why: Keep local wrappers to sanitize and log input/output when orchestrator isn't the one doing Stage 1A.
-try:
-    with open(os.devnull, "w") as _devnull, \
-         contextlib.redirect_stdout(_devnull), \
-         contextlib.redirect_stderr(_devnull):
-        from llm_guard import scan_prompt, scan_output
-        try:
-            from llm_guard.input_scanners import PromptInjection, Secrets, Toxicity, Jailbreak
-            INPUT_SCANNERS = [
-                PromptInjection(threshold=0.1),
-                Jailbreak(threshold=0.1),
-                Secrets(),
-                Toxicity(threshold=0.5),
-            ]
-        except Exception:
-            from llm_guard.input_scanners import PromptInjection, Secrets, Toxicity
-            INPUT_SCANNERS = [
-                PromptInjection(threshold=0.1),
-                Secrets(),
-                Toxicity(threshold=0.5),
-            ]
-        from llm_guard.output_scanners import PII as PIIOut, Toxicity as ToxicityOut
-        OUTPUT_SCANNERS = [PIIOut(), ToxicityOut()]
-        LLM_GUARD_AVAILABLE = True
-
-    try:
-        from loguru import logger as _loguru_logger
-        _loguru_logger.disable("llm_guard")
-        _loguru_logger.disable("protectai")
-        _loguru_logger.disable("inference")
-        _loguru_logger.remove()
-        _loguru_logger.add(sys.stderr, level="ERROR")
-    except Exception:
-        pass
-except Exception:
-    LLM_GUARD_AVAILABLE = False
-    INPUT_SCANNERS, OUTPUT_SCANNERS = [], []
-
-# Denylist (kept for injection/jailbreak phrases)
-# Why: Extra phrasing guard (legacy). Stage 2 regex/denylist in orchestrator generally covers this.
-DENY_PATTERNS = [
-    r"ignore all previous instructions",
-    r"hidden dataset",
-    r"reveal secrets",
-    r"system prompt",
-    r"\bjailbreak\b",
-    r"bypass (?:your|the) (?:rules|guardrails)",
-    r"training data( prompt)?",
-    r"show me (?:the )?hidden",
-]
-def is_policy_denied(q: str) -> bool:
-    ql = q.lower()
-    return any(re.search(p, ql) for p in DENY_PATTERNS)
-
-# Heuristic scans for meter visibility (used only when LLM Guard unavailable)
-# Why: Minimal fallback so Privacy table has some signal if llm_guard import is unavailable.
-HEURISTIC_INJECTION_PATTERNS = [
-    r"(?:remove|disable).*(?:safety|guardrails|constraints)",
-    r"(?:print|disclose|reveal).*(?:internal|configuration|policy|guideline)",
-    r"for this (?:message|response) only.*(?:priority|rule)",
-]
-HEURISTIC_JAILBREAK_PATTERNS = [r"\bact as admin\b", r"\bdeveloper mode\b", r"\bdo anything now\b"]
-HEURISTIC_SECRETS_PATTERNS = [r"\bAKIA[0-9A-Z]{16}\b", r"-----BEGIN (?:RSA )?PRIVATE KEY-----"]
-HEURISTIC_TOXICITY_PATTERNS = [r"\bidiot\b", r"\bstupid\b", r"\bmoron\b", r"\bshut up\b"]
-
-class _SimpleScanResult:
-    def __init__(self, name: str, valid: bool):
-        self.name = name
-        self.valid = valid
-def _heuristic_scan(text: str):
-    t = (text or "")
-    results = []
-    if any(re.search(p, t, flags=re.IGNORECASE) for p in HEURISTIC_INJECTION_PATTERNS):
-        results.append(_SimpleScanResult("PromptInjection", False))
-    if any(re.search(p, t, flags=re.IGNORECASE) for p in HEURISTIC_JAILBREAK_PATTERNS):
-        results.append(_SimpleScanResult("Jailbreak", False))
-    if any(re.search(p, t, flags=re.IGNORECASE) for p in HEURISTIC_SECRETS_PATTERNS):
-        results.append(_SimpleScanResult("Secrets", False))
-    if any(re.search(p, t, flags=re.IGNORECASE) for p in HEURISTIC_TOXICITY_PATTERNS):
-        results.append(_SimpleScanResult("Toxicity", False))
-    return results
-
-# ========= Guardrails AI (optional) =========
-# Why: Extra validation option for generations. We still enforce output gates.
+# ========= Guardrails AI (optional, for LLM prompting) =========
+# Why: Extra validation option for generations. We still enforce output gates via safety_orchestrator.
 try:
     import guardrails as gd
     GUARDRAILS_AVAILABLE = True
@@ -623,42 +539,6 @@ else:
         text = IP_HIDE_RE.sub('REDACTED_IP', text)
         return text
 
-# ========== Guard helpers ==========
-def guard_input(user_text: str):
-    """
-    What: Stage 1A input sanitize via LLM Guard (+ heuristic fallback when unavailable).
-    Why: Run early so we can sanitize prompt and log scanner hits in the Privacy Meter.
-    Returns:
-      - ok, sanitized_text, results (llm_guard objects or heuristics for logging)
-    """
-    if not LLM_GUARD_AVAILABLE:
-        results = _heuristic_scan(user_text)
-        return True, user_text, results
-    try:
-        sanitized, results = scan_prompt(user_text, INPUT_SCANNERS)
-        ok = all(getattr(r, "valid", getattr(r, "is_valid", False)) for r in results)
-        results.extend(_heuristic_scan(user_text))
-        return ok, sanitized, results
-    except Exception as e:
-        print(f"[LLM Guard input error] {e}")
-        results = _heuristic_scan(user_text)
-        return True, user_text, results
-
-def guard_output(text: str):
-    """
-    What: Optional output scan (PII/Toxicity) via LLM Guard when available.
-    Why: Defense-in-depth and additional evidence for the Privacy Meter.
-    """
-    if not LLM_GUARD_AVAILABLE:
-        return True, text, []
-    try:
-        sanitized, results = scan_output(text, OUTPUT_SCANNERS)
-        ok = all(getattr(r, "valid", getattr(r, "is_valid", False)) for r in results)
-        return ok, sanitized, results
-    except Exception as e:
-        print(f"[LLM Guard output error] {e}")
-        return True, text, []
-
 # ========== Formatting ==========
 RE_SPACE = re.compile(r"\s+")
 MAX_VALUE_COL_CHARS = int(os.getenv("TABLE_VALUE_MAX_CHARS", "80"))
@@ -824,12 +704,12 @@ def generate_answer(user_question: str, allowed_context: str, is_admin: bool, fo
     What: Generate an answer strictly from allowed context, with output gating.
     Why:
       - Keep generations context-bound to reduce leakage/hallucinations.
-      - Apply output ANY-TRUE gate:
+      - Apply output ANY-TRUE gate (from safety_orchestrator):
         * self: allow PII (secrets still blocked)
         * others: block PII + secrets
       - Do not overexpose content to the LLM (allowed_context is already filtered/masked).
     """
-    # Prefer a guardrails-validated path if available for extra safety.
+    # Prefer a guardrails-validated path if available for extra safety in generation.
     use_guard = None
     if GUARDRAILS_AVAILABLE:
         if is_self and guard_self is not None:
@@ -841,18 +721,7 @@ def generate_answer(user_question: str, allowed_context: str, is_admin: bool, fo
         try:
             raw, validated = use_guard(llm_call, prompt_params={"question": user_question, "context": allowed_context})
             if validated:
-                ans = str(validated).strip()
-                # For self, skip LLM Guard output scan unless admin requires; for others keep it.
-                if (not is_self) or (is_admin and not ADMIN_BYPASS_LLM_GUARD):
-                    if not (is_admin and ADMIN_BYPASS_LLM_GUARD):
-                        ok_out, safe_ans, _ = guard_output(ans)
-                        if not ok_out and not is_admin:
-                            return "Sorry, I can’t share that content. Please ask a different question."
-                        final_text = safe_ans if ok_out else ans
-                    else:
-                        final_text = ans
-                else:
-                    final_text = ans
+                final_text = str(validated).strip()
 
                 # Output ANY-TRUE — secrets hard-block for all; PII blocked for others.
                 if ANY_TRUE_BLOCK and not (is_admin and ADMIN_BYPASS_ANYTRUE):
@@ -873,16 +742,7 @@ def generate_answer(user_question: str, allowed_context: str, is_admin: bool, fo
 
     # Fallback: plain LLM call (still gated by output ANY-TRUE)
     answer = llm.invoke(compose_prompt(user_question, allowed_context))
-    if is_admin and ADMIN_BYPASS_LLM_GUARD:
-        final_text = str(answer)
-    else:
-        if not is_self:
-            ok_out, safe_answer, _ = guard_output(str(answer))
-            if not ok_out and not is_admin:
-                return "Sorry, I can’t share that content. Please ask a different question."
-            final_text = safe_answer if ok_out else str(answer)
-        else:
-            final_text = str(answer)
+    final_text = str(answer)
 
     if ANY_TRUE_BLOCK and not (is_admin and ADMIN_BYPASS_ANYTRUE):
         ok_any, msg_any, _, _ = guard_output_anytrue(
@@ -940,48 +800,21 @@ def rag_query(question: str, top_k=1):
     """
     What: Full RAG orchestration — input guards -> RBAC -> retrieval/output gates -> answer + Privacy Meter.
     Why:
-      - 1A LLM Guard first: sanitize input + log scanners for Privacy.
+      - 1A LLM Guard sanitize (via safety_orchestrator) to capture scanner hits for Privacy Meter (no block here).
       - 1B RBAC early: self-only policy blocks lateral access before retrieval.
-      - 1C/2 input gates: block injection/jailbreak/secrets; regex/denylist fallback after RBAC (skip for self).
-      - Retrieval/Output: self_ok_pii controls PII policy; secrets always blocked.
+      - 1C/2 input gates (via safety_orchestrator): block injection/jailbreak/secrets; regex/denylist fallback after RBAC (skip for self).
+      - Retrieval/Output: self_ok_pii controls PII policy; secrets always blocked (via safety_orchestrator).
     """
     is_admin = (CURRENT_USER or {}).get("role") == "admin"
 
-    # Stage 1A) LLM Guard sanitize (no denylist here)
-    # Why: Run llm_guard early to sanitize + capture scanner hits for the Privacy Meter.
-    if LLM_GUARD_AVAILABLE:
-        try:
-            ok_in, safe_question, input_results = guard_input(question)
-        except Exception:
-            ok_in, safe_question, input_results = True, question, []
-    else:
+    # Stage 1A) LLM Guard sanitize (no denylist, no block here)
+    # Why: Run llm_guard early (via safety_orchestrator) to sanitize + capture scanner hits for the Privacy Meter.
+    try:
+        ok_in, safe_question, input_results = llm_guard_scan_prompt(question)
+    except Exception:
         ok_in, safe_question, input_results = True, question, []
 
-    # Why: If llm_guard flags and admin is not bypassing, block immediately (prevents prompt-hijack).
-    if not ok_in and not (is_admin and ADMIN_BYPASS_LLM_GUARD):
-        polite = "\n".join([
-            "| Column | Value |","|---|---|",
-            f"| Notice | {FRIENDLY_MSG} |"
-        ])
-        out = f"## Results\n{polite}"
-        if PRIVACY_METER:
-            meter = privacy_meter_report(
-                section_name="Results",
-                question=question,
-                answer_text=polite,
-                user_role=(CURRENT_USER or {}).get("role"),
-                requested_sensitive_cols=[],
-                input_scan_results=input_results,
-                denylist_hit=False,
-                guardrails_blocked=True,
-                trigger_reason="ANY-TRUE input gate (llm_guard_input)",
-                role_verified=is_admin,
-                is_self=False,
-            )
-            out += f"\n\n## Privacy Meter\n{meter}"
-        return out
-
-    # Use sanitized input
+    # Use sanitized input for all downstream processing
     question = safe_question
 
     # Stage 1B) RBAC early (same level as LLM Guard)
@@ -1038,7 +871,7 @@ def rag_query(question: str, top_k=1):
     self_overall = is_self_overall(CURRENT_USER, empids, names)
 
     # Stage 1C) Input third-party guards-only (block injection/jailbreak/secrets/toxicity)
-    # Why: Block on llm_guard; still record who/kinds for Privacy Meter.
+    # Why: Block on llm_guard; still record who/kinds for Privacy Meter (centralized in safety_orchestrator).
     if ANY_TRUE_BLOCK and not (is_admin and ADMIN_BYPASS_ANYTRUE):
         ok_guard, msg_guard, who_guard, kinds_guard = guard_input_anytrue_guards_only(question)
         if not ok_guard:
@@ -1065,7 +898,7 @@ def rag_query(question: str, top_k=1):
             return out
 
     # Stage 2) Input fallback: value-only regex + denylist (after RBAC) — skip for self
-    # Why: Catch literal PII/secrets or common injection phrases (conservative fallback).
+    # Why: Catch literal PII/secrets or common injection phrases (conservative fallback, centralized in safety_orchestrator).
     if ANY_TRUE_BLOCK and not (is_admin and ADMIN_BYPASS_ANYTRUE) and not self_overall:
         ok_rx, msg_rx, who_rx, kinds_rx = guard_input_regex_only(question)
         if not ok_rx:
@@ -1090,31 +923,6 @@ def rag_query(question: str, top_k=1):
                 )
                 out += f"\n\n## Privacy Meter\n{meter}"
             return out
-
-    # Optional denylist (legacy; consider centralizing in orchestrator)
-    denied = is_policy_denied(question)
-    if denied and not (is_admin and ADMIN_BYPASS_DENYLIST):
-        polite = "\n".join([
-            "| Column | Value |","|---|---|",
-            "| Notice | Sorry, I can’t process that request. Please rephrase your question. |"
-        ])
-        out = f"## Results\n{polite}"
-        if PRIVACY_METER:
-            meter = privacy_meter_report(
-                section_name="Results",
-                question=question,
-                answer_text=polite,
-                user_role=(CURRENT_USER or {}).get("role"),
-                requested_sensitive_cols=[],
-                input_scan_results=input_results,
-                denylist_hit=True,
-                guardrails_blocked=True,
-                trigger_reason="Input denylist hit",
-                role_verified=is_admin,
-                is_self=False,
-            )
-            out += f"\n\n## Privacy Meter\n{meter}"
-        return out
 
     # ===== Targeted lookups by EmpID/Name =====
     all_answers = []
@@ -1367,7 +1175,7 @@ def rag_query(question: str, top_k=1):
         if not docs:
             return "## Results\n(No data found)"
 
-        # Retrieval gate for generic queries (not self)
+        # Retrieval gate for generic queries (not self) via safety_orchestrator.
         if ANY_TRUE_BLOCK and not (is_admin and ADMIN_BYPASS_ANYTRUE):
             ok_ret, safe_docs, who_ret, kinds_ret = guard_retrieval_anytrue(docs, self_ok_pii=False)
             if not ok_ret:
