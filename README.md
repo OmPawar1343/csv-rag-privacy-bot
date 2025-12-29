@@ -120,3 +120,21 @@ SENSITIVE_BLOCK_ALL=0       # If 1, hard-blocks sensitive “all details” for 
 # Optional LLM usage in rag.py
 USE_LLM_FOR_TARGETED=0      # If 1, local LLM adds an "Answer" row for targeted queries
 USE_LLM_FOR_GENERIC=0       # If 1, local LLM summarizes generic query context
+
+
+
+
+###Install dependencies
+pip install \
+  chromadb \
+  pandas \
+  tabulate \
+  llm-guard \
+  guardrails-ai \
+  presidio-analyzer \
+  presidio-anonymizer \
+  langchain-core \
+  langchain-ollama \
+  langchain-openai \
+  python-dotenv \
+  requests
