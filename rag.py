@@ -7,9 +7,6 @@
 # - Retrieval/Output: for self = secrets-only block; for others = full PII block via safety_orchestrator.
 # - Raga/Giskard = offline/shadow only.
 
-
-
-
 # --- Silence third‑party logs and progress bars (place at very top) ---
 import os, sys, logging
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
@@ -54,7 +51,9 @@ from collections import defaultdict
 import pandas as pd
 from tabulate import tabulate
 from chromadb import PersistentClient
-from langchain_community.llms.ollama import Ollama
+
+# NEW: modern Ollama provider (compatible with latest langchain-core)
+from langchain_ollama import ChatOllama
 
 from embeddings.embedding_model import get_embedding_model
 from privacy_utils import PRIVACY_METER, privacy_meter_report
@@ -70,11 +69,11 @@ from safety_orchestrator import (
 )
 
 # Config toggles
-USE_LLM_FOR_TARGETED = False
-USE_LLM_FOR_GENERIC = os.getenv("USE_LLM_FOR_GENERIC", "0").lower() in ("1","true","yes","on")
+USE_LLM_FOR_TARGETED = os.getenv("USE_LLM_FOR_TARGETED", "0").lower() in ("1", "true", "yes", "on")
+USE_LLM_FOR_GENERIC  = os.getenv("USE_LLM_FOR_GENERIC",  "0").lower() in ("1","true","yes","on")
 RAG_DISTANCE_THRESHOLD = float(os.getenv("RAG_DISTANCE_THRESHOLD", "0.0"))
 SELF_TARGET_ENABLED = os.getenv("SELF_TARGET_ENABLED", "0").lower() in ("1","true","yes","on")
-MAX_TARGETS = int(os.getenv("MAX_TARGETS", "1"))
+MAX_TARGETS = int(os.getenv("MAX_TARGETS", "3"))
 ANY_TRUE_BLOCK = os.getenv("ANY_TRUE_BLOCK", "1").lower() in ("1","true","yes","on")
 
 # Self-only policy
@@ -84,6 +83,9 @@ SELF_TARGET_PREFER = os.getenv("SELF_TARGET_PREFER", "empid").lower()
 # Admin bypass toggles
 ADMIN_BYPASS_ANYTRUE     = os.getenv("ADMIN_BYPASS_ANYTRUE", "1").lower() in ("1","true","yes","on")
 ADMIN_BYPASS_GUARDRAILS  = os.getenv("ADMIN_BYPASS_GUARDRAILS", "1").lower() in ("1","true","yes","on")
+
+# Admin step-up auth for viewing sensitive fields (PII unlock)
+ADMIN_PII_UNLOCK_PASSWORD = os.getenv("ADMIN_PII_UNLOCK_PASSWORD", "")
 
 # ========= Guardrails AI (optional, for LLM prompting) =========
 # Why: Extra validation option for generations. We still enforce output gates via safety_orchestrator.
@@ -136,10 +138,16 @@ try:
 except Exception:
     PRESIDIO_AVAILABLE = False
 
-# Initialize LLM
-llm = Ollama(model=os.getenv("OLLAMA_MODEL", "tinyllama"), temperature=0.0, num_ctx=512, num_predict=250)
+# ========= Local LLM via Ollama (new provider) =========
+llm = ChatOllama(
+    model=os.getenv("OLLAMA_MODEL", "tinyllama"),
+    temperature=0.0,
+)
+
 def llm_call(prompt: str, **kwargs) -> str:
-    return llm.invoke(prompt)
+    """Wrapper to call local Ollama and return plain text."""
+    resp = llm.invoke(prompt)
+    return getattr(resp, "content", str(resp))
 
 # ========= DB paths (configurable) =========
 DB_PATH = os.getenv("CHROMA_DB_PATH", "db/chroma_db")
@@ -341,6 +349,8 @@ def authenticate(max_attempts=3):
             password = getpass(f"Password (attempt {attempt}/{max_attempts}, typing hidden): ").strip()
         user = USERS.get(username)
         if user and user["password"] == password:
+            # Reset step-up PII flag on every login
+            user["pii_unlocked"] = False
             print(f"✅ Logged in as {username} ({user['role']})")
             return user
         remaining = max_attempts - attempt
@@ -481,7 +491,7 @@ def extract_names_from_text(text: str) -> list[str]:
         first, last = m.group(1).strip(), m.group(2).strip()
         names.add(f"{first.title()} {last.title()}")
     # Capitalized pairs, filter out stop tokens to avoid misclassifying injection phrases.
-    for m in re.finditer(r"\b([A-Z][a-zA-Z'`-]+)\s+([A-Z][a-zA-Z'`-]+)\b", text):
+    for m in re.finditer( r"\band\s+([A-Za-z][a-zA-Z'`-]+)\s+([A-Za-z][a-zA-Z'`-]+)\b", text):
         a, b = m.group(1).strip(), m.group(2).strip()
         if a.lower() in STOP_TOKENS or b.lower() in STOP_TOKENS:
             continue
@@ -538,6 +548,48 @@ else:
         text = SSN_HIDE_RE.sub('REDACTED_SSN', text)
         text = IP_HIDE_RE.sub('REDACTED_IP', text)
         return text
+
+# ========== Admin view masking (step-up PII unlock) ==========
+# Columns that should be masked for admin by default when viewing others.
+ADMIN_MASK_COLS = {
+    "Email", "E-mail", "Mail",
+    "Phone", "Mobile", "Contact",
+    "Address", "Location",
+    "DOB", "Date of Birth", "Birth Date",
+    "Salary", "CTC", "Compensation", "Wage", "Pay",
+    "Aadhaar", "Aadhar", "PAN", "SSN", "Passport", "BankAccount",
+}
+
+def mask_admin_sensitive_table(table_md: str) -> str:
+    """
+    For admin viewing OTHER employees, mask high-sensitive columns in the markdown table
+    unless PII has been explicitly unlocked.
+    """
+    if not table_md:
+        return table_md
+    lines = table_md.splitlines()
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            out.append(line)
+            continue
+        parts = [p.strip() for p in line.split("|")]
+        # Expected: | Column | Value |
+        if len(parts) >= 3:
+            col_name = parts[1]
+            if col_name in ADMIN_MASK_COLS:
+                # Mask the value cell
+                parts[2] = "[REDACTED]"
+                new_line = " | ".join(parts)
+                if stripped.startswith("|") and not new_line.startswith("|"):
+                    new_line = "|" + new_line
+                if stripped.endswith("|") and not new_line.endswith("|"):
+                    new_line = new_line + "|"
+                out.append(new_line)
+                continue
+        out.append(line)
+    return "\n".join(out)
 
 # ========== Formatting ==========
 RE_SPACE = re.compile(r"\s+")
@@ -741,7 +793,7 @@ def generate_answer(user_question: str, allowed_context: str, is_admin: bool, fo
             pass
 
     # Fallback: plain LLM call (still gated by output ANY-TRUE)
-    answer = llm.invoke(compose_prompt(user_question, allowed_context))
+    answer = llm_call(compose_prompt(user_question, allowed_context))
     final_text = str(answer)
 
     if ANY_TRUE_BLOCK and not (is_admin and ADMIN_BYPASS_ANYTRUE):
@@ -770,7 +822,15 @@ def make_polite_refusal(target_label: str, requested_sensitive_cols: list, is_al
     ]
     return "\n".join(lines)
 
-def build_targeted_answer_table(question: str, context: str, allowed_cols: list, for_other: bool, is_admin: bool, is_self: bool = False) -> str:
+def build_targeted_answer_table(
+    question: str,
+    context: str,
+    allowed_cols: list,
+    for_other: bool,
+    is_admin: bool,
+    is_self: bool = False,
+    admin_pii_unlocked: bool = False,
+) -> str:
     """
     What: Build the final table for targeted answers using only allowed columns (masked when needed).
     Why: Control exposure strictly; never pass disallowed data to the LLM or the user.
@@ -785,14 +845,25 @@ def build_targeted_answer_table(question: str, context: str, allowed_cols: list,
             if s:
                 lines.append(f"| Answer | {s} |")
     extracted = extract_values_from_context(context, allowed_cols)
-    masked = {col: mask_value(col, val, for_other) for col, val in extracted.items()}
+    # For admins, don't use mask_value (we control their view via admin_pii_unlocked).
+    masked = {
+        col: mask_value(col, val, (for_other and not is_admin))
+        for col, val in extracted.items()
+    }
     for col in allowed_cols:
         val = masked.get(col, "Not available")
         val = "Not available" if val is None or str(val).strip() == "" else str(val)
         lines.append(f"| {sanitize_cell_value(col)} | {sanitize_cell_value(val)} |")
     answer_table = "\n".join(lines)
+
+    # Output redaction / masking
     if not is_admin and for_other:
+        # Non-admin viewing others: apply PII redaction
         answer_table = redact_pii_text(answer_table)
+    elif is_admin and not admin_pii_unlocked:
+        # Admin (self or others) without PII unlock: mask high-sensitive columns
+        answer_table = mask_admin_sensitive_table(answer_table)
+
     return answer_table
 
 # ========== RAG query ==========
@@ -921,7 +992,7 @@ def rag_query(question: str, top_k=1):
                     role_verified=is_admin,
                     is_self=False,
                 )
-                out += f"\n\n## Privacy Meter\n{meter}"
+            out += f"\n\n## Privacy Meter\n{meter}"
             return out
 
     # ===== Targeted lookups by EmpID/Name =====
@@ -988,7 +1059,9 @@ def rag_query(question: str, top_k=1):
 
         context = chosen
         is_self = is_self_request(CURRENT_USER, target_empid, target_name)
-        for_other = not (is_admin or is_self)
+
+        # "other" means: the target is not the logged-in user, regardless of role
+        for_other = not is_self
 
         restricted_set = set(SENSITIVE_COLS)
         requested_sensitive = []
@@ -1003,7 +1076,7 @@ def rag_query(question: str, top_k=1):
         cats_hit = (q_sensitive_cats & doc_cats) if q_sensitive_cats else set()
         blocked_reasons = list(requested_sensitive) + sorted(list(cats_hit))
 
-        if (SENSITIVE_BLOCK_ALL or for_other) and (parsed["AllDetails"] or blocked_reasons):
+        if (SENSITIVE_BLOCK_ALL or (for_other and not is_admin)) and (parsed["AllDetails"] or blocked_reasons):
             polite_table = make_polite_refusal(
                 target_label=target_label,
                 requested_sensitive_cols=blocked_reasons or ["(restricted fields)"],
@@ -1062,13 +1135,15 @@ def rag_query(question: str, top_k=1):
             all_answers.append(section_md)
             return True
 
+        admin_pii_unlocked = bool((CURRENT_USER or {}).get("pii_unlocked"))
         answer_table = build_targeted_answer_table(
             question=question,
             context=context,
             allowed_cols=allowed_cols,
             for_other=for_other,
             is_admin=is_admin,
-            is_self=is_self
+            is_self=is_self,
+            admin_pii_unlocked=admin_pii_unlocked,
         )
         section_md = f"## Employee {target_label}\n{answer_table}"
         if PRIVACY_METER:
@@ -1228,18 +1303,20 @@ def rag_query(question: str, top_k=1):
                     role_verified=is_admin,
                     is_self=False,
                 )
-                section_md += f"\n\n## Privacy Meter\n{meter}"
+            section_md += f"\n\n## Privacy Meter\n{meter}"
             return section_md
 
         if not USE_LLM_FOR_GENERIC:
             best_doc = docs[0]
+            admin_pii_unlocked = bool((CURRENT_USER or {}).get("pii_unlocked"))
             table = build_targeted_answer_table(
                 question=question,
                 context=best_doc,
                 allowed_cols=allowed_cols_generic,
                 for_other=(not is_admin),
                 is_admin=is_admin,
-                is_self=False
+                is_self=False,
+                admin_pii_unlocked=admin_pii_unlocked,
             )
             section_md = f"## Results\n{table}"
             if PRIVACY_METER:
@@ -1371,7 +1448,7 @@ def markdown_to_table(md_text):
 if __name__ == "__main__":
     CURRENT_USER = authenticate()
     print("👋 Welcome to the CSV RAG Chatbot! 🗂️💬")
-    print("Commands: login | switch | whoami | logout | exit | quit")
+    print("Commands: login | switch | whoami | unlock pii | lock pii | logout | exit | quit")
 
     while True:
         question = input("\nYour Question: ").strip()
@@ -1393,10 +1470,43 @@ if __name__ == "__main__":
                 print("Switch cancelled.")
             continue
 
+        # Admin: unlock PII (step-up auth)
+        if ql in ("unlock pii", "unlock", "unlock pii data"):
+            if not CURRENT_USER or CURRENT_USER.get("role") != "admin":
+                print("Only admin users can unlock sensitive fields.")
+                continue
+            try:
+                from pwinput import pwinput
+                pw = pwinput("Enter PII unlock password: ", mask="*")
+            except Exception:
+                from getpass import getpass
+                pw = getpass("Enter PII unlock password: ")
+            # Allow either dedicated env password or re-using the admin password
+            expected = ADMIN_PII_UNLOCK_PASSWORD or CURRENT_USER.get("password")
+            if pw == expected:
+                CURRENT_USER["pii_unlocked"] = True
+                print("🔓 Sensitive fields unlocked for this session.")
+            else:
+                print("❌ Incorrect unlock password; sensitive fields remain masked.")
+            continue
+
+        # Lock PII again
+        if ql in ("lock pii", "lock"):
+            if CURRENT_USER:
+                CURRENT_USER["pii_unlocked"] = False
+                print("🔒 Sensitive fields locked.")
+            else:
+                print("No active user.")
+            continue
+
         # Show current user
         if ql in ("whoami",):
             u = CURRENT_USER or {}
-            print(f"👤 Current user: {u.get('FullName','-')} (role: {u.get('role','-')}, EmpID: {u.get('EmpID','-')})")
+            unlocked = "yes" if u.get("pii_unlocked") else "no"
+            print(
+                f"👤 Current user: {u.get('FullName','-')} "
+                f"(role: {u.get('role','-')}, EmpID: {u.get('EmpID','-')}, PII unlocked: {unlocked})"
+            )
             continue
 
         print("🤔 Thinking... finding the best answer, please wait...")

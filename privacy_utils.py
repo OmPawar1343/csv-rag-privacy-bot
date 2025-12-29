@@ -185,20 +185,50 @@ def _detect_output_pii(answer_text: str) -> set[str]:
     """
     What: Heuristically detect PII categories present in the final answer text.
     Why: If content leaked, display which kinds (Email/Phone/etc.) were shown.
+         Values that are clearly masked (REDACTED, *** , Not available) do not count as PII shown.
     """
     s = answer_text or ""
     shown = set()
-    # Direct value patterns
+
+    # Direct value patterns (real-looking values)
+    # These ignore redacted placeholders because they don't match these regexes.
     if RE_EMAIL.search(s):        shown.add("Email")
     if _has_phone_like(s):        shown.add("Phone")
     if RE_AADHAAR.search(s):      shown.add("Aadhaar")
     if RE_PAN.search(s):          shown.add("PAN")
 
-    # Table/Markdown label presence (value present and not "Not available")
+    def _is_redacted_value(v: str) -> bool:
+        """Return True if the displayed value is obviously masked / not real PII."""
+        v = (v or "").strip().lower()
+        if not v:
+            return True
+        if "not available" in v:
+            return True
+        if "redacted" in v:
+            return True
+        if "***" in v:
+            return True
+        return False
+
+    # Table/Markdown label presence, but only count if value is not redacted/masked
     def _label_has_value(label: str) -> bool:
-        pat_grid = rf"\|\s*{re.escape(label)}\s*\|\s*(?!Not available)([^|]+)\|"
-        pat_md = rf"\b{re.escape(label)}\b\s*:\s*(?!Not available)\S"
-        return bool(re.search(pat_grid, s, re.I) or re.search(pat_md, s, re.I))
+        # Grid/table row: | Label | Value |
+        pat_grid = rf"\|\s*{re.escape(label)}\s*\|\s*([^|]+)\|"
+        m_grid = re.search(pat_grid, s, re.I)
+        if m_grid:
+            val = m_grid.group(1)
+            if not _is_redacted_value(val):
+                return True
+
+        # Inline: Label: Value
+        pat_md = rf"\b{re.escape(label)}\b\s*:\s*([^\n]+)"
+        m_md = re.search(pat_md, s, re.I)
+        if m_md:
+            val = m_md.group(1)
+            if not _is_redacted_value(val):
+                return True
+
+        return False
 
     label_map = [
         ("Aadhaar", "Aadhaar"), ("Aadhar", "Aadhaar"),
@@ -221,11 +251,13 @@ def _detect_output_pii(answer_text: str) -> set[str]:
     if _has_date_near_label(s, JOINING_LABEL_HINT):
         shown.add("JoiningDate")
 
-    # Loose label matches in narrative text
-    if RE_EMP_ID.search(s):  shown.add("EmpID")
-    if RE_GENDER.search(s):  shown.add("Gender")
-    if RE_ADDR_L.search(s):  shown.add("Address")
-    if RE_SALARY.search(s):  shown.add("Salary")
+    # Loose label matches in narrative text are DISABLED to avoid false positives
+    # when only words like "EmpID" or "Address" appear without real values.
+    # if RE_EMP_ID.search(s):  shown.add("EmpID")
+    # if RE_GENDER.search(s):  shown.add("Gender")
+    # if RE_ADDR_L.search(s):  shown.add("Address")
+    # if RE_SALARY.search(s):  shown.add("Salary")
+
     return shown
 
 def _parse_trigger_info(trigger_reason: str | None) -> tuple[str | None, list[str]]:
